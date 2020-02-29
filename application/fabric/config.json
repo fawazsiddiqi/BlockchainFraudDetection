@@ -1,0 +1,12 @@
+{
+    "channel_name": "mychannel",
+    "smart_contract_name": "telco-roaming-contract",
+    "connection_file": "mychannel_telco-roaming-contract_profile.json",
+    "appAdmin": "test",
+    "appAdminSecret": "testpw",
+    "orgMSPID": "Org1MSP",
+    "caName": "173.193.99.252:31305",
+    "peerName": "173.193.99.252:30664",
+    "ordererName": "173.193.99.252:32034",
+    "gatewayDiscovery": { "enabled": true, "asLocalhost": false }
+ }

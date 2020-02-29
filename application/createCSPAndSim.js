@@ -1,0 +1,432 @@
+'use strict';
+/*
+* Copyright IBM Corp All Rights Reserved
+*
+* SPDX-License-Identifier: Apache-2.0
+*/
+/*
+ * Invoke the telco-roaming-contract to create CSPs and Subscriber Sims.
+ *
+ * 1. call createCSP to create CSP_US
+ * 2. call createCSP to create CSP_EU
+ * 3. call createSubscriberSim to create sim1
+ * 4. call createSubscriberSim to create sim2
+ * 5. call authentication to authenticate sim1
+ * 6. call authentication to authenticate sim2
+ *
+ * Should successfully complete without errors and the ledger should contain the 2 CSPs and the 2 SubscriberSims.
+ * Both the SubscriberSims should have isValid = 'Active'
+ */
+
+let util = require('util');
+
+const fs = require('fs');
+const path = require('path');
+
+// Bring Fabric SDK network class
+const { FileSystemWallet, Gateway } = require('fabric-network');
+
+// A wallet stores a collection of identities for use
+let walletDir = path.join(path.dirname(require.main.filename),'fabric/_idwallet');
+const wallet = new FileSystemWallet(walletDir);
+const configDirectory = path.join(process.cwd(), 'fabric');
+const configPath = path.join(configDirectory, 'config.json');
+const configJSON = fs.readFileSync(configPath, 'utf8');
+const config = JSON.parse(configJSON);
+let channelName = config.channel_name;
+let smartContractName = config.smart_contract_name;
+let connection_file = config.connection_file;
+let appAdmin = config.appAdmin;
+let peerAddr = config.peerName;
+
+let gatewayDiscoveryEnabled = 'enabled' in config.gatewayDiscovery?config.gatewayDiscovery.enabled:true;
+let gatewayDiscoveryAsLocalhost = 'asLocalhost' in config.gatewayDiscovery?config.gatewayDiscovery.asLocalhost:true;
+
+const ccpPath = path.join(configDirectory, connection_file);
+const ccpJSON = fs.readFileSync(ccpPath, 'utf8');
+const ccp = JSON.parse(ccpJSON);
+
+let CSPs = [];
+let SubscriberSims = [];
+let callDetails = [];
+CSPs.push({
+    name: 'CSP_US',
+    region: 'United States',
+    roamingRate: '0.50',
+    overageRate: '0.75'
+});
+
+CSPs.push({
+    name: 'CSP_EU',
+    region: 'European Union',
+    roamingRate: '0.75',
+    overageRate: '1.00'
+});
+
+SubscriberSims.push({
+    publicKey: 'sim1',
+    msisdn: '4691234577',
+    address: 'United States',
+    homeOperatorName: 'CSP_US',
+    roamingPartnerName: '',
+    isRoaming: 'false',
+    location: 'United States',
+    latitude: '40.942746',
+    longitude: '-74.91',
+    roamingRate: '',
+    overageRate: '',
+    callDetails: callDetails,
+    isValid: '',
+    overageThreshold: '2.00',
+    allowOverage: '',
+    overageFlag: 'false'
+});
+
+SubscriberSims.push({
+    publicKey: 'sim2',
+    msisdn: '4691234578',
+    address: 'European Union',
+    homeOperatorName: 'CSP_EU',
+    roamingPartnerName: '',
+    isRoaming: 'false',
+    location: 'European Union',
+    latitude: '36.931',
+    longitude: '-78.994838',
+    roamingRate: '',
+    overageRate: '',
+    callDetails: callDetails,
+    isValid: '',
+    overageThreshold: '1.00',
+    allowOverage: '',
+    overageFlag: 'false'
+});
+
+const gateway = new Gateway();
+let promises = [];
+
+process.on('unhandledRejection', error => {
+    // Will print "unhandledRejection err is not defined"
+    console.log('An unhandled rejection was found - ', error.message);
+    return process.exit(1);
+});
+
+async function main() {
+
+    await gateway.connect(ccp, { wallet, identity: appAdmin , discovery: {enabled: gatewayDiscoveryEnabled, asLocalhost:gatewayDiscoveryAsLocalhost }});
+
+    // eslint-disable-next-line no-unused-vars
+    const network = await gateway.getNetwork(channelName);
+    const client = gateway.getClient();
+    const channel = client.getChannel(channelName);
+
+    let event_hub = channel.newChannelEventHub(peerAddr);
+    let CSP_index = 0, Sim_index = 0, CSP, sim;
+    CSP = CSPs[CSP_index];
+    let tx_id = client.newTransactionID(true);
+    let fcn = 'createCSP';
+    console.log(`Sending transaction proposal for ${fcn} with transaction id ${tx_id._transaction_id}`);
+    // must send the proposal to endorsing peers
+    let request = {
+        //targets: let default to the peer assigned to the client
+        chaincodeId: smartContractName,
+        fcn: fcn,
+        args: [CSP.name, CSP.region, CSP.overageRate, CSP.roamingRate],
+        chainId: channelName,
+        txId: tx_id
+    };
+    // send the transaction proposal to the peers
+    channel.sendTransactionProposal(request).then((results) => {
+        let proposalResponses = results[0];
+        let proposal = results[1];
+        let isProposalGood = false;
+        if (proposalResponses && proposalResponses[0].response && proposalResponses[0].response.status === 200) {
+            isProposalGood = true;
+            console.log('Transaction proposal was good');
+        } else {
+            console.error('Transaction proposal was bad');
+        }
+        if (isProposalGood) {
+            console.log(util.format(
+                'Successfully sent Proposal and received ProposalResponse: Status - %s, message - "%s"',
+                proposalResponses[0].response.status, proposalResponses[0].response.message));
+
+            // build up the request for the orderer to have the transaction committed
+            let request = {
+                proposalResponses: proposalResponses,
+                proposal: proposal
+            };
+
+            let sendPromise = channel.sendTransaction(request);
+            promises.push(sendPromise); //we want the send transaction first, so that we know where to check status
+
+            console.log(`Created Promise - ${fcn} for ` + CSP.name);
+        }
+
+        //console.log("Created eventhub - ", event_hub);
+        event_hub.connect(true);
+        //console.log("connected to eventhub");
+        let regid = event_hub.registerChaincodeEvent('telco-roaming-contract', 'CreateCSPEvent-'+CSP.name, function() {
+            console.log('Found CreateCSPEvent');
+            //console.log(event);
+            //console.log(util.format("Custom event received, payload: %j\n", event.payload.toString()));
+            event_hub.unregisterChaincodeEvent(regid);
+            CSP = CSPs[++CSP_index];
+            let tx_id = client.newTransactionID(true);
+            console.log(`Sending transaction proposal for ${fcn} with transaction id ${tx_id._transaction_id}`);
+            // must send the proposal to endorsing peers
+            let request = {
+                //targets: let default to the peer assigned to the client
+                chaincodeId: smartContractName,
+                fcn: fcn,
+                args: [CSP.name, CSP.region, CSP.overageRate, CSP.roamingRate],
+                chainId: channelName,
+                txId: tx_id
+            };
+            // send the transaction proposal to the peers
+            channel.sendTransactionProposal(request).then((results) => {
+                let proposalResponses = results[0];
+                let proposal = results[1];
+                let isProposalGood = false;
+                if (proposalResponses && proposalResponses[0].response && proposalResponses[0].response.status === 200) {
+                    isProposalGood = true;
+                    console.log('Transaction proposal was good');
+                } else {
+                    console.error('Transaction proposal was bad');
+                }
+                if (isProposalGood) {
+                    console.log(util.format(
+                        'Successfully sent Proposal and received ProposalResponse: Status - %s, message - "%s"',
+                        proposalResponses[0].response.status, proposalResponses[0].response.message));
+
+                    // build up the request for the orderer to have the transaction committed
+                    let request = {
+                        proposalResponses: proposalResponses,
+                        proposal: proposal
+                    };
+
+                    let sendPromise = channel.sendTransaction(request);
+                    promises.push(sendPromise); //we want the send transaction first, so that we know where to check status
+
+                    console.log(`Created Promise - ${fcn} for ` + CSP.name);
+                }
+
+                //console.log("Created eventhub - ", event_hub);
+                event_hub.connect(true);
+                //console.log("connected to eventhub");
+                let regid = event_hub.registerChaincodeEvent('telco-roaming-contract', 'CreateCSPEvent-'+CSP.name, function() {
+                    console.log('Found CreateCSPEvent');
+                    //console.log(event);
+                    //console.log(util.format("Custom event received, payload: %j\n", event.payload.toString()));
+                    event_hub.unregisterChaincodeEvent(regid);
+                    sim = SubscriberSims[Sim_index];
+                    let tx_id = client.newTransactionID(true);
+                    fcn = 'createSubscriberSim';
+                    console.log(`Sending transaction proposal for ${fcn} with transaction id ${tx_id._transaction_id}`);
+                    // must send the proposal to endorsing peers
+                    let request = {
+                        //targets: let default to the peer assigned to the client
+                        chaincodeId: smartContractName,
+                        fcn: fcn,
+                        args: [sim.publicKey, sim.msisdn, sim.address, sim.homeOperatorName, sim.roamingPartnerName, sim.isRoaming, sim.location, sim.latitude, sim.longitude, sim.roamingRate, sim.overageRate, sim.callDetails, sim.isValid, sim.overageThreshold, sim.allowOverage, sim.overageFlag],
+                        chainId: channelName,
+                        txId: tx_id
+                    };
+                    // send the transaction proposal to the peers
+                    channel.sendTransactionProposal(request).then((results) => {
+                        let proposalResponses = results[0];
+                        let proposal = results[1];
+                        let isProposalGood = false;
+                        if (proposalResponses && proposalResponses[0].response && proposalResponses[0].response.status === 200) {
+                            isProposalGood = true;
+                            console.log('Transaction proposal was good');
+                        } else {
+                            console.error('Transaction proposal was bad');
+                        }
+                        if (isProposalGood) {
+                            console.log(util.format(
+                                'Successfully sent Proposal and received ProposalResponse: Status - %s, message - "%s"',
+                                proposalResponses[0].response.status, proposalResponses[0].response.message));
+
+                            // build up the request for the orderer to have the transaction committed
+                            let request = {
+                                proposalResponses: proposalResponses,
+                                proposal: proposal
+                            };
+
+                            let sendPromise = channel.sendTransaction(request);
+                            promises.push(sendPromise); //we want the send transaction first, so that we know where to check status
+
+                            console.log(`Created Promise - ${fcn} for ` + sim.publicKey);
+                        }
+
+                        //console.log("Created eventhub - ", event_hub);
+                        event_hub.connect(true);
+                        //console.log("connected to eventhub");
+                        let regid = event_hub.registerChaincodeEvent('telco-roaming-contract', 'CreateSubscriberSimEvent-'+sim.publicKey, function() {
+                            console.log('Found CreateSubscriberSimEvent');
+                            //console.log(event);
+                            //console.log(util.format("Custom event received, payload: %j\n", event.payload.toString()));
+                            event_hub.unregisterChaincodeEvent(regid);
+                            sim = SubscriberSims[++Sim_index];
+                            let tx_id = client.newTransactionID(true);
+                            console.log(`Sending transaction proposal for ${fcn} with transaction id ${tx_id._transaction_id}`);
+                            // must send the proposal to endorsing peers
+                            let request = {
+                                //targets: let default to the peer assigned to the client
+                                chaincodeId: smartContractName,
+                                fcn: fcn,
+                                args: [sim.publicKey, sim.msisdn, sim.address, sim.homeOperatorName, sim.roamingPartnerName, sim.isRoaming, sim.location, sim.latitude, sim.longitude, sim.roamingRate, sim.overageRate, sim.callDetails, sim.isValid, sim.overageThreshold, sim.allowOverage, sim.overageFlag],
+                                chainId: channelName,
+                                txId: tx_id
+                            };
+                            // send the transaction proposal to the peers
+                            channel.sendTransactionProposal(request).then((results) => {
+                                let proposalResponses = results[0];
+                                let proposal = results[1];
+                                let isProposalGood = false;
+                                if (proposalResponses && proposalResponses[0].response && proposalResponses[0].response.status === 200) {
+                                    isProposalGood = true;
+                                    console.log('Transaction proposal was good');
+                                } else {
+                                    console.error('Transaction proposal was bad');
+                                }
+                                if (isProposalGood) {
+                                    console.log(util.format(
+                                        'Successfully sent Proposal and received ProposalResponse: Status - %s, message - "%s"',
+                                        proposalResponses[0].response.status, proposalResponses[0].response.message));
+
+                                    // build up the request for the orderer to have the transaction committed
+                                    let request = {
+                                        proposalResponses: proposalResponses,
+                                        proposal: proposal
+                                    };
+
+                                    let sendPromise = channel.sendTransaction(request);
+                                    promises.push(sendPromise); //we want the send transaction first, so that we know where to check status
+
+                                    console.log(`Created Promise - ${fcn} for ` + sim.publicKey);
+                                }
+
+                                //console.log("Created eventhub - ", event_hub);
+                                event_hub.connect(true);
+                                //console.log("connected to eventhub");
+                                let regid = event_hub.registerChaincodeEvent('telco-roaming-contract', 'CreateSubscriberSimEvent-'+sim.publicKey, function() {
+                                    console.log('Found CreateSubscriberSimEvent');
+                                    //console.log(event);
+                                    //console.log(util.format("Custom event received, payload: %j\n", event.payload.toString()));
+                                    event_hub.unregisterChaincodeEvent(regid);
+                                    sim = SubscriberSims[--Sim_index];
+                                    let tx_id = client.newTransactionID(true);
+
+                                    let fcn = 'authentication';
+                                    console.log(`Sending transaction proposal for ${fcn} with transaction id ${tx_id._transaction_id}`);
+                                    // must send the proposal to endorsing peers
+                                    let request = {
+                                        //targets: let default to the peer assigned to the client
+                                        chaincodeId: smartContractName,
+                                        fcn: fcn,
+                                        args: [sim.publicKey],
+                                        chainId: channelName,
+                                        txId: tx_id
+                                    };
+                                    // send the transaction proposal to the peers
+                                    channel.sendTransactionProposal(request).then((results) => {
+                                        let proposalResponses = results[0];
+                                        let proposal = results[1];
+                                        let isProposalGood = false;
+                                        if (proposalResponses && proposalResponses[0].response && proposalResponses[0].response.status === 200) {
+                                            isProposalGood = true;
+                                            console.log('Transaction proposal was good');
+                                        } else {
+                                            console.error('Transaction proposal was bad');
+                                        }
+                                        if (isProposalGood) {
+                                            console.log(util.format(
+                                                'Successfully sent Proposal and received ProposalResponse: Status - %s, message - "%s"',
+                                                proposalResponses[0].response.status, proposalResponses[0].response.message));
+
+                                            // build up the request for the orderer to have the transaction committed
+                                            let request = {
+                                                proposalResponses: proposalResponses,
+                                                proposal: proposal
+                                            };
+
+                                            let sendPromise = channel.sendTransaction(request);
+                                            promises.push(sendPromise); //we want the send transaction first, so that we know where to check status
+
+                                            console.log(`Created Promise - ${fcn} for ` + sim.publicKey);
+                                        }
+
+                                        //console.log("Created eventhub - ", event_hub);
+                                        event_hub.connect(true);
+                                        //console.log("connected to eventhub");
+                                        let regid = event_hub.registerChaincodeEvent('telco-roaming-contract', 'AuthenticationEvent-'+sim.publicKey, function() {
+                                            console.log('Found AuthenticationEvent');
+                                            //console.log(event);
+                                            //console.log(util.format("Custom event received, payload: %j\n", event.payload.toString()));
+                                            event_hub.unregisterChaincodeEvent(regid);
+                                            sim = SubscriberSims[++Sim_index];
+                                            let tx_id = client.newTransactionID(true);
+
+                                            console.log(`Sending transaction proposal for ${fcn} with transaction id ${tx_id._transaction_id}`);
+                                            // must send the proposal to endorsing peers
+                                            let request = {
+                                                //targets: let default to the peer assigned to the client
+                                                chaincodeId: smartContractName,
+                                                fcn: fcn,
+                                                args: [sim.publicKey],
+                                                chainId: channelName,
+                                                txId: tx_id
+                                            };
+                                            // send the transaction proposal to the peers
+                                            channel.sendTransactionProposal(request).then((results) => {
+                                                let proposalResponses = results[0];
+                                                let proposal = results[1];
+                                                let isProposalGood = false;
+                                                if (proposalResponses && proposalResponses[0].response && proposalResponses[0].response.status === 200) {
+                                                    isProposalGood = true;
+                                                    console.log('Transaction proposal was good');
+                                                } else {
+                                                    console.error('Transaction proposal was bad');
+                                                }
+                                                if (isProposalGood) {
+                                                    console.log(util.format(
+                                                        'Successfully sent Proposal and received ProposalResponse: Status - %s, message - "%s"',
+                                                        proposalResponses[0].response.status, proposalResponses[0].response.message));
+
+                                                    // build up the request for the orderer to have the transaction committed
+                                                    let request = {
+                                                        proposalResponses: proposalResponses,
+                                                        proposal: proposal
+                                                    };
+
+                                                    let sendPromise = channel.sendTransaction(request);
+                                                    promises.push(sendPromise); //we want the send transaction first, so that we know where to check status
+
+                                                    console.log(`Created Promise - ${fcn} for ` + sim.publicKey);
+                                                }
+
+                                                //console.log("Created eventhub - ", event_hub);
+                                                event_hub.connect(true);
+                                                //console.log("connected to eventhub");
+                                                let regid = event_hub.registerChaincodeEvent('telco-roaming-contract', 'AuthenticationEvent-'+sim.publicKey, function() {
+                                                    console.log('Found AuthenticationEvent');
+                                                    //console.log(event);
+                                                    //console.log(util.format("Custom event received, payload: %j\n", event.payload.toString()));
+                                                    event_hub.unregisterChaincodeEvent(regid);
+                                                    return process.exit(0);
+                                                });
+                                            });
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
+
+main();
